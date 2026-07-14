@@ -40,6 +40,25 @@ echo
 
 # Reseteamos para partir de un estado limpio
 curl -s -X POST $URL/api/admin/reset > /dev/null
+
+# ---------- AISLAR LA VARIABLE ----------
+# Aqui probamos el BLOQUEO PESIMISTA. Si Pagos falla (lo hace un 10%
+# a proposito), la compra del ganador se cae y el asiento se devuelve
+# por compensacion -> el conteo final saldria mal y pareceria que el
+# bloqueo fallo, cuando en realidad fallo el pago.
+# Apagamos los fallos de Pagos durante esta demo.
+PAGOS_POD=$(kubectl get pods -n $NS -l app=payments -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n $NS $PAGOS_POD -- wget -qO- --post-data='{"tasaFalloNormal":0}' \
+  --header='Content-Type: application/json' http://localhost:3000/chaos > /dev/null 2>&1 || true
+
+restaurar() {
+  kubectl exec -n $NS $PAGOS_POD -- wget -qO- --post-data='{"tasaFalloNormal":0.1}' \
+    --header='Content-Type: application/json' http://localhost:3000/chaos > /dev/null 2>&1 || true
+}
+trap restaurar EXIT
+
+# Dejamos que el circuit breaker se cierre si venia contaminado
+sleep 12
 sleep 1
 
 azul "[1/4] EL ESCENARIO:"
