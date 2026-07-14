@@ -1,0 +1,150 @@
+# =============================================================
+#  00 - NAMESPACE + BASE DE DATOS
+# =============================================================
+#  Un NAMESPACE es como una carpeta: agrupa todos nuestros
+#  recursos y los aisla del resto del cluster.
+# =============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ticketing
+
+---
+# =============================================================
+#  EL ESQUEMA DE LA BASE DE DATOS
+# =============================================================
+#  Un ConfigMap es un archivo de configuracion que k8s le pasa
+#  al contenedor. Postgres ejecuta automaticamente cualquier .sql
+#  que encuentre en /docker-entrypoint-initdb.d/ al arrancar.
+# =============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-init
+  namespace: ticketing
+data:
+  init.sql: |
+    -- ---- TABLA DE ASIENTOS ----
+    -- Aqui vive el recurso escaso por el que compiten los usuarios.
+    -- La fila del evento es la que se BLOQUEA con SELECT ... FOR UPDATE.
+    CREATE TABLE IF NOT EXISTS seats (
+      event_id        TEXT PRIMARY KEY,
+      total_seats     INT NOT NULL,
+      available_seats INT NOT NULL CHECK (available_seats >= 0)
+      -- ^^^^^^ ESTE CHECK ES IMPORTANTE:
+      -- es la ULTIMA linea de defensa contra el overselling.
+      -- Si por un bug se nos escapara un descuento de mas,
+      -- la base de datos misma rechazaria la transaccion.
+      -- (Con el bloqueo pesimista nunca deberia dispararse,
+      --  pero defensa en profundidad nunca sobra.)
+    );
+
+    -- ---- TABLA DE RESERVAS CONFIRMADAS ----
+    CREATE TABLE IF NOT EXISTS reservations (
+      id         TEXT PRIMARY KEY,
+      event_id   TEXT NOT NULL,
+      user_id    TEXT NOT NULL,
+      quantity   INT  NOT NULL,
+      payment_id TEXT,
+      status     TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- ---- LA DEAD-LETTER QUEUE ----
+    -- El "buzon de mensajes que no se pudieron entregar".
+    -- Cuando Notificaciones esta caido, los correos aterrizan aqui
+    -- en vez de perderse. Un worker los reintenta cada 15 segundos.
+    CREATE TABLE IF NOT EXISTS dead_letter_queue (
+      id             TEXT PRIMARY KEY,
+      reservation_id TEXT NOT NULL,
+      payload        JSONB NOT NULL,
+      error          TEXT,
+      created_at     TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- ---- DATOS DE PRUEBA ----
+    -- Un concierto con 100 asientos.
+    INSERT INTO seats (event_id, total_seats, available_seats)
+    VALUES ('concierto-2026', 100, 100)
+    ON CONFLICT (event_id) DO NOTHING;
+
+    -- Un evento con UN SOLO ASIENTO.
+    -- Este es el que usamos en la demo de la CONDICION DE CARRERA:
+    -- lanzamos 20 compradores a la vez y solo uno puede ganar.
+    INSERT INTO seats (event_id, total_seats, available_seats)
+    VALUES ('ultimo-asiento', 1, 1)
+    ON CONFLICT (event_id) DO NOTHING;
+
+---
+# =============================================================
+#  POSTGRES
+# =============================================================
+#  Lo fijamos al SITIO A (nodeSelector). En un sistema real la BD
+#  seria un cluster replicado, pero para esta practica una sola
+#  instancia basta y hace mas facil demostrar el fallo de
+#  conectividad intermitente (fallo #4).
+# =============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: ticketing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      nodeSelector:
+        sitio: sitio-a          # <- la BD vive en el sitio A
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              value: postgres
+            - name: POSTGRES_DB
+              value: ticketing
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            # Aqui montamos el init.sql del ConfigMap de arriba.
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { memory: "128Mi", cpu: "100m" }
+            limits:   { memory: "512Mi", cpu: "500m" }
+      volumes:
+        - name: init
+          configMap:
+            name: db-init
+        - name: data
+          emptyDir: {}   # datos efimeros: se pierden al reiniciar. Nos sirve.
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ticketing
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

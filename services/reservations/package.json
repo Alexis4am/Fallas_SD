@@ -1,0 +1,12 @@
+{
+  "name": "reservations",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "axios": "^1.7.2",
+    "opossum": "^8.1.4",
+    "pg": "^8.12.0"
+  }
+}
