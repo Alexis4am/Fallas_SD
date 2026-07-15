@@ -1,47 +1,16 @@
-// =============================================================
-//  SERVICIO DE RESERVAS  (el CORE del sistema)
-// =============================================================
-//  Este es el orquestador. Cuando alguien compra una entrada:
-//     1. le pide un asiento a INVENTARIO
-//     2. le pide el cobro a PAGOS
-//     3. le pide el correo a NOTIFICACIONES
-//
-//  Aqui viven 3 de los 4 mecanismos de resiliencia:
-//
-//   DEFENSA #1  RETRY con BACKOFF EXPONENCIAL  -> hacia Inventario
-//               (protege del fallo "El Inventario Fantasma")
-//
-//   DEFENSA #2  TIMEOUT + CIRCUIT BREAKER      -> hacia Pagos
-//               (protege del fallo "La Pasarela Lenta")
-//
-//   DEFENSA #3  FALLBACK + DEAD-LETTER QUEUE   -> hacia Notificaciones
-//               (protege del fallo "El Correo Perdido")
-// =============================================================
+/**
+ * Servicio de Reservas (Core/Orquestador)
+ * Coordina el flujo principal de compra integrando Inventario, Pagos y Notificaciones.
+ * Implementa 3 mecanismos clave de resiliencia:
+ * 1. Retry con Backoff Exponencial (hacia Inventario)
+ * 2. Timeout + Circuit Breaker (hacia Pagos)
+ * 3. Fallback + Dead-Letter Queue (hacia Notificaciones)
+ */
 
 const express = require('express');
 const axios = require('axios');
 const http = require('http');
 
-// =============================================================
-//  AGENTE HTTP SIN KEEP-ALIVE  (critico para que el RETRY sirva)
-// =============================================================
-//  PROBLEMA QUE ESTO RESUELVE:
-//
-//  El Service de Kubernetes balancea con iptables, y la decision de
-//  a que pod ir se toma AL ABRIR LA CONEXION TCP, no en cada peticion.
-//
-//  Node reutiliza las conexiones (keep-alive) por defecto. Resultado:
-//  si el primer intento cayo en la replica ROTA, la conexion queda
-//  PEGADA a esa replica... y los 5 reintentos van AL MISMO POD MUERTO.
-//  El retry se vuelve inutil: reintenta 5 veces contra el mismo cadaver.
-//
-//  LA SOLUCION: keepAlive: false -> cada intento abre una conexion
-//  NUEVA, asi iptables vuelve a sortear el destino y el reintento
-//  tiene la oportunidad de caer en la replica VIVA.
-//
-//  Es un detalle sutil y muy real: un retry mal configurado a nivel
-//  de transporte NO PROTEGE DE NADA, aunque el codigo parezca correcto.
-// =============================================================
 const agenteSinKeepAlive = new http.Agent({ keepAlive: false });
 const CircuitBreaker = require('opossum');
 const { Pool } = require('pg');
@@ -77,26 +46,9 @@ const log = (msg, extra = {}) =>
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // =============================================================
-//  DEFENSA #1 -> RETRY CON BACKOFF EXPONENCIAL
-//  Protege de: "El Inventario Fantasma" (el pod de inventario muere)
+//  MECANISMO 1: Retry con Backoff Exponencial y Jitter
 // =============================================================
-//  Por que RETRY y no Circuit Breaker aqui?
-//
-//  Porque el fallo es TRANSITORIO y hay REDUNDANCIA. Inventario tiene
-//  2 replicas repartidas en 2 nodos. Si matamos una, k8s saca ese pod
-//  del Service en segundos y la otra replica sigue viva. El intento
-//  que falla es solo el que agarro el pod moribundo: si esperamos un
-//  poquito y volvemos a intentar, el Service nos rutea a la replica sana.
-//
-//  Un Circuit Breaker seria CONTRAPRODUCENTE: abriria el circuito y
-//  dejaria de llamar a un servicio que en realidad SI esta disponible
-//  (en el otro nodo). Cortariamos el brazo sano.
-//
-//  El BACKOFF EXPONENCIAL (200ms, 400ms, 800ms, 1600ms) evita que
-//  todos los clientes reintenten a la vez y rematen al servicio que
-//  se esta recuperando (evita el "retry storm" / efecto manada).
-//  El JITTER (ruido aleatorio) desincroniza aun mas los reintentos.
-// =============================================================
+
 async function conRetry(fn, { intentos = 5, baseMs = 200, etiqueta = 'op' } = {}) {
   let ultimoError;
 
@@ -110,18 +62,14 @@ async function conRetry(fn, { intentos = 5, baseMs = 200, etiqueta = 'op' } = {}
     } catch (err) {
       ultimoError = err;
 
-      // OJO: un 409 (no hay asientos) NO es un fallo transitorio.
-      // Es una respuesta legitima del negocio. Reintentar seria absurdo.
-      // Solo reintentamos errores de RED o 5xx.
       const status = err.response?.status;
       const esReintentable = !status || status >= 500;
-      if (!esReintentable) throw err;
+      if (!esReintentable) throw err; 
 
-      if (intento === intentos) break; // se acabaron los intentos
+      if (intento === intentos) break;
 
-      // backoff exponencial: base * 2^(intento-1)
       const espera = baseMs * Math.pow(2, intento - 1);
-      const jitter = Math.random() * 100; // ruido para desincronizar
+      const jitter = Math.random() * 100;
       const total = Math.round(espera + jitter);
 
       log('RETRY: intento fallido, reintentando', {
@@ -138,49 +86,27 @@ async function conRetry(fn, { intentos = 5, baseMs = 200, etiqueta = 'op' } = {}
 }
 
 // =============================================================
-//  DEFENSA #2 -> TIMEOUT + CIRCUIT BREAKER
-//  Protege de: "La Pasarela Lenta" (Pagos tarda 20 segundos)
+//  MECANISMO 2: Circuit Breaker y Timestamps
 // =============================================================
-//  Por que CIRCUIT BREAKER y no Retry aqui?
-//
-//  Porque el problema NO es que Pagos este caido: es que esta SATURADO.
-//  Si reintentamos, le mandamos MAS carga a un servicio que ya se esta
-//  ahogando. Lo empeoramos. Es echarle gasolina al fuego.
-//
-//  El Circuit Breaker hace lo contrario: DEJA DE LLAMARLO.
-//  Funciona como el breaker electrico de tu casa. Tres estados:
-//
-//    CERRADO (closed)     -> todo normal, las llamadas pasan.
-//    ABIERTO (open)       -> demasiados fallos. Ya ni intentamos:
-//                            fallamos INSTANTANEAMENTE (fail fast).
-//                            Asi (a) el usuario no espera 20s colgado
-//                            y (b) le damos aire a Pagos para recuperarse.
-//    SEMI-ABIERTO (half)  -> tras 10s dejamos pasar una llamada de prueba.
-//                            Si funciona -> cerramos. Si no -> abrimos otra vez.
-//
-//  El TIMEOUT (3s) es lo que convierte "lento" en "fallo". Sin timeout,
-//  el breaker nunca se enteraria de nada: las llamadas simplemente se
-//  quedarian colgadas para siempre, agotando el pool de conexiones
-//  (esto es el fallo en cascada clasico).
-// =============================================================
+
 async function llamarPagos({ reservationId, amount, userId }) {
   const { data } = await axios.post(
     `${PAYMENTS_URL}/payments/charge`,
     { reservationId, amount, userId },
-    { timeout: 3000 } // <-- 3s y ni uno mas
+    { timeout: 3000 }
   );
   return data;
 }
 
 const breakerPagos = new CircuitBreaker(llamarPagos, {
-  timeout: 3000,                 // mas de 3s = fallo
-  errorThresholdPercentage: 50,  // si >50% falla...
-  resetTimeout: 10000,           // ...abre 10s antes de probar de nuevo
-  volumeThreshold: 3,            // minimo 3 llamadas antes de decidir
+  timeout: 3000,                
+  errorThresholdPercentage: 50, 
+  resetTimeout: 10000,          
+  volumeThreshold: 3,    
   name: 'payments',
 });
 
-// Log de cada cambio de estado (esto es ORO en la demo en vivo)
+
 breakerPagos.on('open', () =>
   log('CIRCUITO ABIERTO: dejamos de llamar a Pagos (fail fast)', { estado: 'OPEN' }));
 breakerPagos.on('halfOpen', () =>
@@ -193,39 +119,19 @@ breakerPagos.on('reject', () =>
   log('RECHAZADO por el circuito abierto: no se llamo a Pagos', { estado: 'OPEN' }));
 
 // =============================================================
-//  DEFENSA #3 -> FALLBACK + DEAD-LETTER QUEUE
-//  Protege de: "El Correo Perdido" (Notificaciones esta caido)
+//  MECANISMO 3: Degradación Elegante y Dead-Letter Queue (DLQ)
 // =============================================================
-//  Por que FALLBACK + DLQ y no un retry bloqueante?
-//
-//  Porque enviar el email NO ES CRITICO. El usuario ya pago y ya tiene
-//  su asiento. Que el correo falle no debe tumbar la compra.
-//
-//  El principio se llama DEGRADACION ELEGANTE: cuando algo secundario
-//  se rompe, el sistema pierde una funcionalidad, no el servicio entero.
-//
-//  Pero tampoco queremos PERDER el correo. Entonces:
-//    - Timeout muy corto (1s): no dejamos que el camino critico espere.
-//    - Si falla -> guardamos el mensaje en la DEAD-LETTER QUEUE (una
-//      tabla en la BD). Es un buzon de "esto hay que reintentarlo despues".
-//    - Devolvemos 201 CREATED igual. La compra fue un exito.
-//    - Un worker aparte drena la DLQ cuando Notificaciones revive.
-//
-//  Lo que NO hacemos: propagar el error al usuario. Seria absurdo
-//  decirle "tu compra fallo" cuando en realidad si tiene su entrada.
-// =============================================================
+
 async function notificarConFallback({ reservationId, userId, eventId }) {
   try {
     await axios.post(
       `${NOTIFICATIONS_URL}/notifications/send`,
       { reservationId, userId, eventId, type: 'confirmation' },
-      { timeout: 1000 } // 1s: el camino critico no espera por un email
+      { timeout: 1000 } 
     );
     log('email enviado', { reservationId });
     return { emailSent: true, queued: false };
   } catch (err) {
-    // ---- FALLBACK ----
-    // No explotamos. Guardamos el mensaje para reintentarlo luego.
     await pool.query(
       `INSERT INTO dead_letter_queue (id, reservation_id, payload, error, created_at)
        VALUES ($1, $2, $3, $4, NOW())`,
@@ -243,8 +149,8 @@ async function notificarConFallback({ reservationId, userId, eventId }) {
   }
 }
 
-// ---------------- Health checks ----------------
 app.get('/healthz', (_req, res) => res.json({ status: 'ok', pod: POD_NAME, node: NODE_NAME }));
+
 app.get('/readyz', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -254,7 +160,6 @@ app.get('/readyz', async (_req, res) => {
   }
 });
 
-// Endpoint para ver el estado del circuito en vivo durante la demo
 app.get('/metrics/circuit', (_req, res) => {
   const s = breakerPagos.stats;
   res.json({
@@ -267,7 +172,6 @@ app.get('/metrics/circuit', (_req, res) => {
   });
 });
 
-// Endpoint para ver que hay en la DLQ durante la demo
 app.get('/metrics/dlq', async (_req, res) => {
   const { rows } = await pool.query(
     'SELECT id, reservation_id, error, created_at FROM dead_letter_queue ORDER BY created_at DESC LIMIT 20'
@@ -277,10 +181,9 @@ app.get('/metrics/dlq', async (_req, res) => {
 });
 
 // =============================================================
-//  EL ENDPOINT PRINCIPAL: COMPRAR UNA ENTRADA
+//  Flujo Principal de Orquestación (Saga Pattern)
 // =============================================================
-//  Aqui se ve el flujo completo con las 3 defensas en accion.
-// =============================================================
+
 app.post('/reservations', async (req, res) => {
   const { eventId = 'concierto-2026', userId = 'anon', quantity = 1, amount = 50 } = req.body;
   const reservationId = randomUUID();
@@ -288,7 +191,7 @@ app.post('/reservations', async (req, res) => {
 
   log('--- nueva reserva ---', { reservationId, eventId, userId, quantity });
 
-  // ---------- PASO 1: pedir el asiento (protegido por RETRY) ----------
+  // PASO 1: Bloqueo de inventario (Protegido por Retry)
   let hold;
   try {
     hold = await conRetry(
@@ -297,12 +200,7 @@ app.post('/reservations', async (req, res) => {
           `${INVENTORY_URL}/inventory/${eventId}/hold`,
           { quantity, reservationId },
           {
-            // 800ms: un pod SANO en la misma red responde en ~50ms.
-            // Si tarda mas, esta muerto. No vale la pena esperarlo 2s.
             timeout: 800,
-            // SIN keep-alive: cada reintento abre conexion NUEVA, para
-            // que el Service pueda ruteallo a la OTRA replica. Sin esto,
-            // los 5 reintentos van al mismo pod roto y el retry no sirve.
             httpAgent: agenteSinKeepAlive,
           }
         );
@@ -311,7 +209,6 @@ app.post('/reservations', async (req, res) => {
       { intentos: 5, baseMs: 200, etiqueta: 'inventory.hold' }
     );
   } catch (err) {
-    // Si es 409, es que se acabaron los asientos: respuesta de negocio normal.
     if (err.response?.status === 409) {
       log('sin asientos disponibles', { reservationId });
       return res.status(409).json({
@@ -320,7 +217,7 @@ app.post('/reservations', async (req, res) => {
         reason: 'No quedan asientos disponibles',
       });
     }
-    // Si llegamos aqui, ni siquiera con 5 reintentos pudimos hablar con Inventario.
+    
     log('ERROR CONTROLADO: inventario inalcanzable tras todos los reintentos', { reservationId });
     return res.status(503).json({
       reservationId,
@@ -329,16 +226,12 @@ app.post('/reservations', async (req, res) => {
     });
   }
 
-  // ---------- PASO 2: cobrar (protegido por CIRCUIT BREAKER) ----------
+  // PASO 2: Procesamiento de Pago (Protegido por Circuit Breaker)
   let payment;
   try {
     payment = await breakerPagos.fire({ reservationId, amount, userId });
     log('pago aprobado', { reservationId, paymentId: payment.paymentId });
   } catch (err) {
-    // El pago fallo (timeout, error, o circuito abierto).
-    // ---- COMPENSACION estilo SAGA ----
-    // Ya habiamos apartado el asiento. Hay que DEVOLVERLO, o quedaria
-    // bloqueado para siempre por una compra que nunca se completo.
     log('pago fallido -> COMPENSANDO: devolvemos el asiento al inventario', {
       reservationId, error: err.message,
     });
@@ -360,21 +253,20 @@ app.post('/reservations', async (req, res) => {
         ? 'La pasarela de pagos no responde (circuito abierto). Asiento liberado. Reintenta en unos segundos.'
         : 'El pago no pudo procesarse. Asiento liberado.',
       circuitBreaker: circuitoAbierto ? 'OPEN' : 'CLOSED',
-      tiempoMs: Date.now() - t0, // <- fijate: falla RAPIDO, no en 20s
+      tiempoMs: Date.now() - t0, 
     });
   }
 
-  // ---------- PASO 3: persistir la reserva ----------
+  // PASO 3: Persistencia de datos
   await pool.query(
     `INSERT INTO reservations (id, event_id, user_id, quantity, payment_id, status, created_at)
      VALUES ($1,$2,$3,$4,$5,'CONFIRMED',NOW())`,
     [reservationId, eventId, userId, quantity, payment.paymentId]
   );
 
-  // ---------- PASO 4: notificar (protegido por FALLBACK + DLQ) ----------
+  // PASO 4: Notificación (Protegida por Fallback + DLQ)
   const notificacion = await notificarConFallback({ reservationId, userId, eventId });
 
-  // ---------- LISTO ----------
   const tiempoMs = Date.now() - t0;
   log('RESERVA CONFIRMADA', { reservationId, tiempoMs, ...notificacion });
 
@@ -385,11 +277,10 @@ app.post('/reservations', async (req, res) => {
     quantity,
     asientosRestantes: hold.remaining,
     paymentId: payment.paymentId,
-    // Si el email fallo, lo decimos, pero la compra SIGUE SIENDO EXITOSA.
     notificacion: notificacion.emailSent
       ? 'Correo de confirmacion enviado'
       : 'No pudimos enviar el correo ahora; quedo en cola y se enviara automaticamente. Tu entrada esta confirmada.',
-    inventarioAtendidoPor: hold.servedBy, // prueba de que se reparte entre nodos
+    inventarioAtendidoPor: hold.servedBy,
     servedBy: { pod: POD_NAME, node: NODE_NAME },
     tiempoMs,
   });
@@ -402,12 +293,9 @@ app.get('/reservations/:id', async (req, res) => {
 });
 
 // =============================================================
-//  WORKER DE LA DLQ
+//  Worker: Procesamiento en segundo plano de DLQ
 // =============================================================
-//  Cada 15 segundos revisa si hay correos pendientes y trata de
-//  enviarlos. Cuando Notificaciones revive, la cola se drena sola.
-//  Esto cierra el ciclo del patron: nada se pierde, solo se retrasa.
-// =============================================================
+
 async function drenarDLQ() {
   try {
     const { rows } = await pool.query(
@@ -425,18 +313,20 @@ async function drenarDLQ() {
           { reservationId: msg.reservation_id, ...payload },
           { timeout: 2000 }
         );
+        
+        // Eliminación de la cola tras éxito
         await pool.query('DELETE FROM dead_letter_queue WHERE id = $1', [msg.id]);
         log('DLQ drenada: correo pendiente enviado con exito', {
           reservationId: msg.reservation_id,
         });
       } catch (e) {
-        // Sigue caido. Lo dejamos en la cola y probamos en el proximo ciclo.
       }
     }
   } catch (e) {
-    // La BD puede estar caida (fallo #4). No pasa nada, reintentamos luego.
   }
 }
+
+// Ejecución periódica cada 15 segundos
 setInterval(drenarDLQ, 15000);
 
 app.listen(PORT, () => log(`reservas escuchando en :${PORT}`));

@@ -1,26 +1,3 @@
-# =============================================================
-#  01 - SERVICIO DE INVENTARIO
-# =============================================================
-#  *** ESTE ES EL MANIFIESTO MAS IMPORTANTE DE LA PRACTICA ***
-#
-#  La rubrica pide (20 pts): "al menos un componente critico
-#  replicado entre ambos [nodos]". Ese componente es este.
-#
-#  Tiene 2 REPLICAS y las OBLIGAMOS a estar una en cada sitio.
-#  Eso significa que si un nodo entero se muere, la otra replica
-#  sigue viva y el sistema no cae.
-#
-#  Usamos DOS mecanismos complementarios para lograrlo:
-#
-#   1) topologySpreadConstraints -> "repartelas entre los sitios"
-#   2) podAntiAffinity           -> "y ademas, nunca dos en el mismo nodo"
-#
-#  Con los dos juntos, Kubernetes NO TIENE OPCION: una en sitio-a,
-#  otra en sitio-b. Puedes verificarlo con:
-#     kubectl get pods -n ticketing -o wide
-#  y mirar la columna NODE.
-# =============================================================
-
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,28 +5,11 @@ metadata:
   namespace: ticketing
   labels:
     app: inventory
-    tier: critical          # lo marcamos como critico
+    tier: critical
 spec:
-  replicas: 2               # <--- DOS replicas, una por sitio
-  # =========================================================
-  #  ESTRATEGIA DE ROLLOUT  (sin esto, los despliegues SE ATASCAN)
-  # =========================================================
-  #  Por defecto k8s usa maxSurge: 25%, o sea: "crea el pod NUEVO
-  #  antes de matar el viejo". Pero mas abajo tenemos reglas ESTRICTAS
-  #  (podAntiAffinity + topologySpread con DoNotSchedule) que prohiben
-  #  dos pods de inventory en el mismo nodo.
-  #
-  #  Con 2 replicas y 2 nodos, no queda NINGUN nodo libre donde poner
-  #  el pod nuevo -> se queda en Pending para siempre -> deadlock.
-  #
-  #  La solucion: maxSurge 0 (nunca crees pods de mas) y
-  #  maxUnavailable 1 (permite que uno este caido mientras lo
-  #  reemplazas). Asi siempre hay hueco.
-  #
-  #  TRADE-OFF REAL: ganamos tolerancia a fallos (las replicas nunca
-  #  coinciden de nodo) a costa de capacidad reducida DURANTE el
-  #  despliegue. En produccion tendrias mas nodos que replicas.
-  # =========================================================
+  replicas: 2
+  # maxSurge: 0 evita deadlock con topologySpread (DoNotSchedule):
+  # con 2 réplicas y 2 nodos no hay espacio para un 3er pod temporal.
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -64,18 +24,7 @@ spec:
         app: inventory
         tier: critical
     spec:
-      # =========================================================
-      #  MECANISMO 1: TOPOLOGY SPREAD CONSTRAINTS
-      # =========================================================
-      #  Traduccion: "reparte los pods de forma pareja entre los
-      #  valores de la etiqueta 'sitio'. La diferencia maxima
-      #  permitida entre un sitio y otro es de 1 pod."
-      #
-      #  Con 2 replicas y 2 sitios: 1 y 1. Perfecto.
-      #
-      #  DoNotSchedule = si no puedo cumplir esto, NO despliegues
-      #  el pod. Es una regla DURA, no una sugerencia.
-      # =========================================================
+      # Garantiza una réplica por sitio (regla dura: DoNotSchedule).
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: sitio
@@ -83,17 +32,7 @@ spec:
           labelSelector:
             matchLabels:
               app: inventory
-
-      # =========================================================
-      #  MECANISMO 2: POD ANTI-AFFINITY
-      # =========================================================
-      #  Traduccion: "no pongas dos pods de inventory en el mismo
-      #  nodo fisico (hostname)".
-      #
-      #  Es el cinturon ademas de los tirantes. Aunque alguien
-      #  cambiara las etiquetas de sitio, esto seguiria garantizando
-      #  la separacion fisica.
-      # =========================================================
+      # Refuerzo: nunca dos pods de inventory en el mismo nodo físico.
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -101,21 +40,13 @@ spec:
                 matchLabels:
                   app: inventory
               topologyKey: kubernetes.io/hostname
-
       containers:
         - name: inventory
           image: ticketing/inventory:v1
-          imagePullPolicy: IfNotPresent   # usa la imagen local de kind
-
+          imagePullPolicy: IfNotPresent
           env:
-            # ---- LA DOWNWARD API ----
-            # Kubernetes le "cuenta" al contenedor en que pod y en que
-            # nodo esta corriendo. El servicio devuelve estos datos en
-            # cada respuesta HTTP.
-            #
-            # POR QUE IMPORTA: en la demo, haces varios curl y ves que
-            # unas respuestas vienen de sitio-a y otras de sitio-b.
-            # Eso PRUEBA visualmente que el balanceo entre nodos funciona.
+            # Downward API: el pod expone su nombre y nodo en cada respuesta,
+            # lo que permite verificar visualmente el balanceo entre sitios.
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -132,37 +63,24 @@ spec:
               value: postgres
             - name: DB_NAME
               value: ticketing
-
           ports:
             - containerPort: 3000
-
-          # =====================================================
-          #  LAS PROBES (sondas de salud)
-          # =====================================================
-          #  livenessProbe  = "estas vivo?"  Si falla -> k8s REINICIA el pod.
-          #  readinessProbe = "estas listo?" Si falla -> k8s deja de mandarte
-          #                                   trafico, pero NO te reinicia.
-          #
-          #  La readiness es la clave del fallo #1: cuando matas un pod,
-          #  k8s lo saca del Service en cuanto la readiness falla, asi
-          #  el trafico se va SOLO a la replica sana. El retry de Reservas
-          #  aprovecha exactamente esa ventana.
-          # =====================================================
           livenessProbe:
             httpGet:
               path: /healthz
               port: 3000
             initialDelaySeconds: 5
             periodSeconds: 10
-
+          # readinessProbe: cuando falla, k8s saca el pod del Service
+          # sin reiniciarlo, permitiendo que el retry de Reservas
+          # caiga en la réplica sana del otro sitio.
           readinessProbe:
             httpGet:
               path: /readyz
               port: 3000
             initialDelaySeconds: 3
-            periodSeconds: 3      # revisa cada 3s -> reaccion rapida
+            periodSeconds: 3
             failureThreshold: 2
-
           resources:
             requests: { memory: "64Mi", cpu: "50m" }
             limits:   { memory: "256Mi", cpu: "300m" }
@@ -175,28 +93,19 @@ metadata:
   namespace: ticketing
 spec:
   selector:
-    app: inventory        # <- balancea entre LAS DOS replicas
+    app: inventory
   ports:
     - port: 3000
       targetPort: 3000
 
 ---
-# =============================================================
-#  POD DISRUPTION BUDGET  (bonus para la nota)
-# =============================================================
-#  Le dice a Kubernetes: "en las operaciones voluntarias
-#  (drenar un nodo, actualizar el cluster), SIEMPRE debe quedar
-#  al menos 1 pod de inventory corriendo".
-#
-#  Sin esto, un `kubectl drain` podria tumbar las dos replicas
-#  a la vez y dejarte sin inventario. Con esto, k8s se niega.
-# =============================================================
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: inventory-pdb
   namespace: ticketing
 spec:
+  # Durante operaciones voluntarias (drain, upgrade), mínimo 1 pod activo.
   minAvailable: 1
   selector:
     matchLabels:

@@ -1,50 +1,15 @@
 #!/usr/bin/env bash
-# =============================================================
-#  FALLO #1 - "EL INVENTARIO FANTASMA"
-#  Defensa: RETRY CON BACKOFF EXPONENCIAL
-# =============================================================
+# FALLO #1 - "EL INVENTARIO FANTASMA"
+# Defensa: RETRY CON BACKOFF EXPONENCIAL
 #
-#  COMO PROVOCAMOS EL FALLO
-#
-#  Descartamos dos metodos que NO funcionan:
-#
-#  1) `kubectl delete pod` -> muerte AVISADA. Kubernetes saca el pod
-#     del Service ANTES de matarlo: el trafico se redirige limpio y
-#     el RETRY NUNCA SE DISPARA. Sale 100% sin probar nada.
-#
-#  2) `kill -9 1` dentro del contenedor -> IMPOSIBLE. El kernel de
-#     Linux ignora las senales al PID 1 si no tiene handler. El
-#     comando devuelve exito pero el proceso sigue vivo.
-#
-#  Lo que SI hacemos: activamos un "modo caos" en UNA replica. Sigue
-#  en pie, sigue ACEPTANDO conexiones, pero las FALLA con 503.
-#  Simula un servicio "vivo pero roto" (agoto su pool, perdio la BD):
-#  el fallo mas comun en produccion y el mas peligroso, porque desde
-#  fuera parece sano.
-#
-#  -------------------------------------------------------------
-#  LA VENTANA (esto es lo importante de entender)
-#
-#  Al fallar la readinessProbe, Kubernetes saca el pod del Service.
-#  Pero TARDA ~6 segundos (2 fallos x 3s de periodo).
-#
-#  Durante ESA VENTANA el Service le sigue mandando trafico a un pod
-#  roto. Ahi es donde el retry demuestra su valor.
-#
-#  Pasada la ventana, k8s ya lo saco y TODO el trafico va a la replica
-#  sana: no hay nada que reintentar. Por eso el trafico debe caber
-#  DENTRO de la ventana. Si mandamos trafico durante 20 segundos,
-#  la mayoria llega cuando el pod roto ya deberia estar fuera... pero
-#  como lo revivimos y volvemos a romper, todo falla.
-#
-#  Por eso: rafaga CORTA y DENSA, dentro de la ventana de ~6s.
-#  -------------------------------------------------------------
-# =============================================================
+# Activa modo caos en una replica: sigue viva pero falla con 503.
+# Simula un servicio vivo pero roto durante la ventana de ~6s
+# antes de que la readinessProbe lo saque del Service.
 
 set -e
 NS=ticketing
 URL=http://localhost:30080
-TOTAL=20          # rafaga corta: debe caber en la ventana de ~6s
+TOTAL=20
 
 azul()  { echo -e "\033[1;34m$1\033[0m"; }
 verde() { echo -e "\033[1;32m$1\033[0m"; }
@@ -57,14 +22,10 @@ azul " Defensa esperada: RETRY CON BACKOFF"
 azul "=============================================="
 echo
 
-# ---------- ESTADO LIMPIO ----------
 curl -s -X POST $URL/api/admin/reset > /dev/null
 DISP=$(curl -s $URL/api/inventory/concierto-2026 | jq -r '.available_seats')
 echo "  inventario reseteado: $DISP asientos"
 
-# ---------- AISLAR LA VARIABLE ----------
-# Pagos falla un 10% a proposito. Esos fallos TAMBIEN dan 503 y se
-# confundirian con los del inventario. Los apagamos durante la demo.
 PAGOS_POD=$(kubectl get pods -n $NS -l app=payments -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n $NS $PAGOS_POD -- wget -qO- --post-data='{"tasaFalloNormal":0}' \
   --header='Content-Type: application/json' http://localhost:3000/chaos > /dev/null 2>&1 || true
@@ -77,7 +38,7 @@ restaurar_todo() {
   kubectl exec -n $NS $PAGOS_POD -- wget -qO- --post-data='{"tasaFalloNormal":0.1}' \
     --header='Content-Type: application/json' http://localhost:3000/chaos > /dev/null 2>&1 || true
 }
-trap restaurar_todo EXIT   # pase lo que pase, dejamos el sistema sano
+trap restaurar_todo EXIT
 
 azul "[1/4] ESTADO INICIAL: las dos replicas de inventario"
 kubectl get pods -n $NS -l app=inventory -o wide
@@ -96,7 +57,6 @@ sleep 1
 DESDE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 TMP=$(mktemp -d)
 
-# ---------- ROMPEMOS UNA REPLICA ----------
 rojo "[3/4] >>> INYECTANDO EL FALLO <<<"
 echo
 VICTIMA=$(kubectl get pods -n $NS -l app=inventory -o jsonpath='{.items[0].metadata.name}')
@@ -114,8 +74,6 @@ ama "  Las que caigan en la replica rota van a fallar -> el RETRY"
 ama "  debe reintentar y ruteallas a la replica VIVA."
 echo
 
-# ---------- RAFAGA CORTA Y DENSA, DENTRO DE LA VENTANA ----------
-# En paralelo, para que las 20 caigan dentro de los ~6 segundos.
 for i in $(seq 1 $TOTAL); do
   (
     C=$(curl -s -o /dev/null -w "%{http_code}" -m 15 -X POST $URL/api/reservations \
@@ -126,16 +84,14 @@ for i in $(seq 1 $TOTAL); do
   sleep 0.1
 done
 
-wait    # esperamos a que TODAS terminen (incluidos sus reintentos)
+wait
 echo
 
-# ---------- AHORA SI, revivimos ----------
 ama "Trafico terminado. Reviviendo la replica..."
 kubectl exec -n $NS $VICTIMA -- wget -qO- --post-data='{"caido":false}' \
   --header='Content-Type: application/json' http://localhost:3000/chaos > /dev/null 2>&1 || true
 echo
 
-# ---------- CONTAMOS ----------
 OK=0; ERR=0; AGOTADO=0
 for i in $(seq 1 $TOTAL); do
   C=$(cat "$TMP/c-$i.txt" 2>/dev/null || echo "000")

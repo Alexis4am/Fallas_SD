@@ -1,25 +1,11 @@
 #!/usr/bin/env bash
-# =============================================================
-#  FALLO #3 - "EL CORREO PERDIDO"
-#  Defensa: FALLBACK + DEAD-LETTER QUEUE
-# =============================================================
+# FALLO #3 - "EL CORREO PERDIDO"
+# Defensa: FALLBACK + DEAD-LETTER QUEUE
 #
-#  QUE VAMOS A HACER:
-#  Apagar COMPLETAMENTE el Servicio de Notificaciones
-#  (kubectl scale --replicas=0). Cero pods. Desaparece.
-#
-#  QUE DEBERIA PASAR:
-#  El usuario COMPRA IGUAL. Recibe su entrada. Status 201 CONFIRMED.
-#  El correo no se envia, pero TAMPOCO SE PIERDE: se guarda en la
-#  Dead-Letter Queue.
-#
-#  Y cuando revivimos el servicio, el worker drena la cola SOLO
-#  y los correos salen. Nada se perdio, solo se retraso.
-#
-#  ESTE ES EL FALLO QUE MEJOR DEMUESTRA "DEGRADACION ELEGANTE":
-#  se rompe una pieza secundaria y el sistema pierde una funcion,
-#  NO el servicio entero.
-# =============================================================
+# Apaga Notificaciones por completo (replicas=0).
+# Las compras siguen funcionando (HTTP 201).
+# Los correos no entregados se guardan en la DLQ y se
+# reenvian automaticamente al restaurar el servicio.
 
 set -e
 NS=ticketing
@@ -36,29 +22,14 @@ azul " Defensa esperada: FALLBACK + DEAD-LETTER QUEUE"
 azul "=============================================="
 echo
 
-# ---------- ESTADO LIMPIO ----------
-# Sin esto, al correr las demos varias veces se acaban los asientos
-# y todo devuelve 409 en vez de probar el fallo real.
 curl -s -X POST $URL/api/admin/reset > /dev/null
 echo "  inventario reseteado a 100 asientos"
 
-# ---------- AISLAR LA VARIABLE ----------
-# Esta demo prueba la DLQ (el fallo del CORREO). Pero Pagos falla un
-# 10% a proposito, y esos fallos tumban la compra ANTES de llegar al
-# paso del correo -> nunca se llenaria la DLQ y saldrian 503 que no
-# tienen nada que ver con lo que estamos probando.
-#
-# Peor aun: esos fallos aleatorios ABREN EL CIRCUIT BREAKER, que
-# entonces bloquea las compras siguientes.
-#
-# Metodo cientifico: una variable a la vez. Apagamos los fallos de
-# Pagos durante ESTA demo y los restauramos al final.
 PAGOS_POD=$(kubectl get pods -n $NS -l app=payments -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n $NS $PAGOS_POD -- wget -qO- --post-data='{"tasaFalloNormal":0}' \
   --header='Content-Type: application/json' http://localhost:3000/chaos > /dev/null 2>&1 || true
 echo "  fallos aleatorios de Pagos: DESACTIVADOS (aislamos la variable)"
 
-# Pase lo que pase, restauramos Pagos y Notificaciones al salir
 restaurar() {
   kubectl scale deploy/notifications --replicas=1 -n $NS > /dev/null 2>&1 || true
   kubectl exec -n $NS $PAGOS_POD -- wget -qO- --post-data='{"tasaFalloNormal":0.1}' \
@@ -66,13 +37,9 @@ restaurar() {
 }
 trap restaurar EXIT
 
-# Esperamos a que el circuit breaker se cierre, por si viene contaminado
-# de una demo anterior (resetTimeout es de 10s).
 echo "  esperando a que el circuit breaker se estabilice..."
 sleep 12
 
-# Compra de humo: si esto no da CONFIRMED, el sistema no esta sano
-# y la demo no seria valida.
 HUMO=$(curl -s -X POST $URL/api/reservations -H 'Content-Type: application/json' \
   -d '{"eventId":"concierto-2026","userId":"humo","quantity":1}' | jq -r '.status')
 if [ "$HUMO" != "CONFIRMED" ]; then
@@ -92,7 +59,6 @@ curl -s $URL/api/metrics/dlq | jq '{pendientes}'
 echo
 sleep 2
 
-# ---------- EL CAOS ----------
 rojo "[2/5] >>> INYECTANDO EL FALLO <<<"
 rojo "Apagando Notificaciones POR COMPLETO (replicas = 0)..."
 kubectl scale deploy/notifications --replicas=0 -n $NS
@@ -103,7 +69,6 @@ kubectl get pods -n $NS -l app=notifications 2>/dev/null || echo "  (ninguno - e
 echo
 sleep 2
 
-# ---------- LA PRUEBA CLAVE ----------
 ama "[3/5] LA PREGUNTA DEL MILLON:"
 ama "Con Notificaciones MUERTO, se puede seguir comprando?"
 echo
@@ -140,7 +105,6 @@ verde "^^^ Ahi estan, guardados y esperando. Ninguno se perdio."
 echo
 sleep 3
 
-# ---------- RECUPERACION AUTOMATICA ----------
 azul "[5/5] Revivimos Notificaciones..."
 kubectl scale deploy/notifications --replicas=1 -n $NS
 kubectl wait --for=condition=ready pod -l app=notifications -n $NS --timeout=60s

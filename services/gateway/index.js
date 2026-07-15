@@ -1,26 +1,9 @@
-// =============================================================
-//  API GATEWAY
-// =============================================================
-//  Es la unica puerta de entrada del sistema. Todo el trafico de
-//  los clientes pasa por aqui antes de llegar a Reservas.
-//
-//  Tiene dos protecciones (que NO son de los 4 mecanismos evaluados,
-//  pero suman puntos y hacen la demo del "Diluvio" mas interesante):
-//
-//   - RATE LIMIT: maximo N peticiones por IP por minuto.
-//   - BULKHEAD:   maximo M peticiones concurrentes hacia Reservas.
-//
-//  El BULKHEAD (mamparo) es el concepto de los compartimentos
-//  estancos de un barco: si una seccion se inunda, el agua no
-//  pasa a las demas y el barco no se hunde. Aqui: limitamos cuantas
-//  peticiones simultaneas dejamos pasar. Las que sobran se rechazan
-//  con un 429 INMEDIATO en vez de acumularse en una cola infinita.
-//
-//  Sin bulkhead, un pico de trafico llena la memoria de peticiones
-//  encoladas, cada una esperando; las latencias explotan, los
-//  timeouts se disparan en cascada, y el sistema entero colapsa.
-//  Es mejor rechazar rapido al 20% que hacer fallar al 100%.
-// =============================================================
+/**
+ * API Gateway
+ * Puerta de entrada única del sistema. Enruta el tráfico hacia los microservicios internos.
+ * Implementa el patrón Bulkhead para limitar la concurrencia y prevenir el colapso en cascada 
+ * bajo picos de alta demanda, rechazando el tráfico excedente de forma rápida (Fail Fast).
+ */
 
 const express = require('express');
 const axios = require('axios');
@@ -34,7 +17,6 @@ const NODE_NAME = process.env.NODE_NAME || 'node-local';
 const RESERVATIONS_URL = process.env.RESERVATIONS_URL || 'http://reservations:3000';
 const INVENTORY_URL = process.env.INVENTORY_URL || 'http://inventory:3000';
 
-// Cuantas peticiones simultaneas dejamos pasar como maximo.
 const MAX_CONCURRENTES = parseInt(process.env.MAX_CONCURRENT || '20', 10);
 
 const log = (msg, extra = {}) =>
@@ -43,10 +25,11 @@ const log = (msg, extra = {}) =>
     pod: POD_NAME, node: NODE_NAME, msg, ...extra,
   }));
 
-// ---------------- BULKHEAD ----------------
-let enVuelo = 0;      // cuantas peticiones estoy atendiendo AHORA
-let rechazadas = 0;   // contador para las metricas de la demo
-let aceptadas = 0;
+
+let enVuelo = 0;     
+let rechazadas = 0;  
+let aceptadas = 0;    
+
 
 function bulkhead(req, res, next) {
   if (enVuelo >= MAX_CONCURRENTES) {
@@ -54,8 +37,7 @@ function bulkhead(req, res, next) {
     log('BULKHEAD: capacidad llena -> rechazo rapido (429)', {
       enVuelo, limite: MAX_CONCURRENTES, rechazadasTotal: rechazadas,
     });
-    // 429 = "Too Many Requests". Rechazo INMEDIATO y honesto.
-    // Mejor esto que dejarlo esperar 30s para al final fallar igual.
+    
     return res.status(429).json({
       error: 'Sistema con alta demanda. Por favor intenta de nuevo en unos segundos.',
       retryAfter: 2,
@@ -64,15 +46,16 @@ function bulkhead(req, res, next) {
 
   enVuelo++;
   aceptadas++;
-  res.on('finish', () => { enVuelo--; }); // liberar el cupo al terminar
+  
+  res.on('finish', () => { enVuelo--; });
   next();
 }
 
-// ---------------- Health ----------------
+
 app.get('/healthz', (_req, res) => res.json({ status: 'ok', pod: POD_NAME, node: NODE_NAME }));
 app.get('/readyz', (_req, res) => res.json({ status: 'ready', pod: POD_NAME, node: NODE_NAME }));
 
-// Metricas del bulkhead, para mostrarlas en la demo del "Diluvio"
+
 app.get('/metrics/bulkhead', (_req, res) => {
   res.json({
     enVueloAhora: enVuelo,
@@ -83,7 +66,7 @@ app.get('/metrics/bulkhead', (_req, res) => {
   });
 });
 
-// ---------------- Rutas (todas pasan por el bulkhead) ----------------
+
 app.post('/api/reservations', bulkhead, async (req, res) => {
   try {
     const { data, status } = await axios.post(
@@ -98,6 +81,7 @@ app.post('/api/reservations', bulkhead, async (req, res) => {
   }
 });
 
+
 app.get('/api/inventory/:eventId', bulkhead, async (req, res) => {
   try {
     const { data, status } = await axios.get(
@@ -110,7 +94,7 @@ app.get('/api/inventory/:eventId', bulkhead, async (req, res) => {
   }
 });
 
-// Proxys de conveniencia hacia las metricas internas
+
 app.get('/api/metrics/circuit', async (_req, res) => {
   try {
     const { data } = await axios.get(`${RESERVATIONS_URL}/metrics/circuit`, { timeout: 3000 });
@@ -128,7 +112,7 @@ app.get('/api/metrics/dlq', async (_req, res) => {
 app.post('/api/admin/reset', async (_req, res) => {
   try {
     const { data } = await axios.post(`${INVENTORY_URL}/admin/reset`, {}, { timeout: 5000 });
-    rechazadas = 0; aceptadas = 0;
+    rechazadas = 0; aceptadas = 0; 
     res.json(data);
   } catch (e) { res.status(503).json({ error: e.message }); }
 });

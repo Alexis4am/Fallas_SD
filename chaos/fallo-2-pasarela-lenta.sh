@@ -1,34 +1,11 @@
 #!/usr/bin/env bash
-# =============================================================
-#  FALLO #2 - "LA PASARELA LENTA"
-#  Defensa: TIMEOUT + CIRCUIT BREAKER
-# =============================================================
+# FALLO #2 - "LA PASARELA LENTA"
+# Defensa: TIMEOUT + CIRCUIT BREAKER
 #
-#  QUE VAMOS A HACER:
-#  Poner al Servicio de Pagos a tardar 20 SEGUNDOS en responder.
-#
-#  QUE DEBERIA PASAR:
-#  - Las primeras peticiones fallan a los 3s (TIMEOUT), no a los 20s.
-#  - Tras varios fallos, el CIRCUITO SE ABRE.
-#  - Con el circuito abierto, las siguientes fallan al instante:
-#    ya ni siquiera llamamos a Pagos. Eso es FAIL FAST.
-#  - El asiento se DEVUELVE al inventario (compensacion).
-#  - Cuando apagamos el caos, el circuito se cierra SOLO.
-#
-#  -------------------------------------------------------------
-#  DETALLE IMPORTANTE DE SISTEMAS DISTRIBUIDOS:
-#
-#  El circuit breaker vive EN LA MEMORIA DE CADA POD. No es un
-#  estado compartido. Y tenemos 2 REPLICAS de Reservas.
-#
-#  O sea: hay DOS circuitos independientes, y el balanceador
-#  reparte las peticiones entre ambos. Para que los dos se abran,
-#  cada pod debe acumular SUS PROPIOS fallos.
-#
-#  Por eso mandamos 14 peticiones y no 6: con 6, cada pod recibia
-#  solo ~3 y se quedaba justo en el borde del umbral sin abrir.
-#  -------------------------------------------------------------
-# =============================================================
+# Pone a Pagos a responder con 20s de latencia.
+# El timeout de 3s convierte "lento" en "fallo".
+# Tras acumular fallos, el circuito se abre y las peticiones
+# fallan al instante sin tocar Pagos (fail fast).
 
 set -e
 NS=ticketing
@@ -46,9 +23,6 @@ azul " Defensa esperada: TIMEOUT + CIRCUIT BREAKER"
 azul "=============================================="
 echo
 
-# ---------- ESTADO LIMPIO ----------
-# Sin esto, al correr las demos varias veces se acaban los asientos
-# y todo devuelve 409 en vez de probar el fallo real.
 curl -s -X POST $URL/api/admin/reset > /dev/null
 echo "  inventario reseteado a 100 asientos"
 echo
@@ -73,7 +47,6 @@ curl -s -X POST $URL/api/reservations \
 echo
 sleep 1
 
-# ---------- EL CAOS ----------
 rojo "[3/5] >>> INYECTANDO EL FALLO <<<"
 rojo "Poniendo a Pagos a tardar 20 SEGUNDOS..."
 kubectl exec -n $NS $PAGOS_POD -- \
@@ -86,8 +59,8 @@ echo
 ama "Mandando $PETICIONES compras. Observa la columna tiempoMs:"
 echo
 
-LENTAS=0     # fallaron por timeout (~3000ms) -> circuito aun CERRADO
-RAPIDAS=0    # fallaron al instante (<500ms)  -> CIRCUITO ABIERTO
+LENTAS=0
+RAPIDAS=0
 
 for i in $(seq 1 $PETICIONES); do
   R=$(curl -s -X POST $URL/api/reservations \
@@ -99,8 +72,6 @@ for i in $(seq 1 $PETICIONES); do
   ESTADO=$(echo "$R" | jq -r '.status')
   POD=$(echo "$R" | jq -r '.servedBy.pod // "?"' | tail -c 6)
 
-  # Un fallo RAPIDO solo puede significar una cosa: el circuito
-  # estaba ABIERTO y ni se molesto en llamar a Pagos.
   if [ "$TIEMPO" -lt 500 ] 2>/dev/null; then
     RAPIDAS=$((RAPIDAS + 1))
     rojo "  #$i [..$POD] -> $ESTADO | ${TIEMPO}ms | $CIRCUITO  <-- FAIL FAST!"
@@ -115,8 +86,6 @@ azul "[4/5] Estado del circuito DURANTE el fallo:"
 curl -s $URL/api/metrics/circuit | jq '.'
 echo
 
-# ---------- VEREDICTO HONESTO ----------
-# No AFIRMAMOS que se abrio: lo COMPROBAMOS midiendo.
 echo "  ---------------------------------------------"
 printf "   Fallos por TIMEOUT   (~3000ms) : %s\n" "$LENTAS"
 printf "   Fallos por FAIL FAST (<500ms)  : %s\n" "$RAPIDAS"
@@ -135,7 +104,6 @@ fi
 echo
 sleep 2
 
-# ---------- RECUPERACION ----------
 azul "[5/5] Apagamos el caos. Pagos vuelve a la normalidad..."
 kubectl exec -n $NS $PAGOS_POD -- \
   wget -qO- --post-data='{"lento":false}' \
